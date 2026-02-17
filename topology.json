@@ -1,0 +1,16 @@
+{
+    "192.168.122.103": [
+        {
+            "neighbor_ip": null,
+            "device_id": "R2.bigtopo",
+            "local_interface": "GigabitEthernet0/0",
+            "remote_interface": "GigabitEthernet0/0"
+        },
+        {
+            "neighbor_ip": null,
+            "device_id": "R3.bigtopo",
+            "local_interface": "GigabitEthernet0/2",
+            "remote_interface": "GigabitEthernet0/2"
+        }
+    ]
+}

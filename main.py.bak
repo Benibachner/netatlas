@@ -1,0 +1,18 @@
+import argparse
+
+def add_args(parser):
+    parser.add_argument("filename")           # positional argument
+
+def main():
+    parser = argparse.ArgumentParser(
+                        prog="netatlas",
+                        description="Discovers a network topology and visualizes it in a graph",)
+    add_args(parser)
+
+    args = parser.parse_args()
+
+
+
+
+if __name__ == "__main__":
+    main()
