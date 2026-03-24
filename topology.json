@@ -1,16 +1,59 @@
 {
-    "192.168.122.103": [
-        {
-            "neighbor_ip": null,
-            "device_id": "R2.bigtopo",
-            "local_interface": "GigabitEthernet0/0",
-            "remote_interface": "GigabitEthernet0/0"
-        },
-        {
-            "neighbor_ip": null,
-            "device_id": "R3.bigtopo",
-            "local_interface": "GigabitEthernet0/2",
-            "remote_interface": "GigabitEthernet0/2"
-        }
-    ]
+  "R1": {
+    "management_ip": "192.168.122.103",
+    "device_type": "Unknown",
+    "interfaces": {
+      "GigabitEthernet0/0": "10.0.1.1",
+      "GigabitEthernet0/1": "192.168.122.103",
+      "GigabitEthernet0/2": "10.0.3.2"
+    },
+    "descriptions": {
+      "GigabitEthernet0/0": "",
+      "GigabitEthernet0/1": "",
+      "GigabitEthernet0/2": "",
+      "GigabitEthernet0/3": ""
+    },
+    "neighbors": {
+      "R2": {
+        "local_interface": "GigabitEthernet0/0",
+        "remote_interface": "GigabitEthernet0/0",
+        "cdp_remote_ip": "10.0.1.2",
+        "remote_type": "Router"
+      },
+      "R3": {
+        "local_interface": "GigabitEthernet0/2",
+        "remote_interface": "GigabitEthernet0/2",
+        "cdp_remote_ip": "10.0.3.1",
+        "remote_type": "Router"
+      }
+    }
+  },
+  "R2": {
+    "management_ip": "10.0.1.2",
+    "device_type": "Unknown",
+    "interfaces": {
+      "GigabitEthernet0/0": "10.0.1.2",
+      "GigabitEthernet0/1": "10.0.2.1"
+    },
+    "descriptions": {
+      "GigabitEthernet0/0": "",
+      "GigabitEthernet0/1": "",
+      "GigabitEthernet0/2": "",
+      "GigabitEthernet0/3": ""
+    },
+    "neighbors": {
+      "R1": {
+        "local_interface": "GigabitEthernet0/0",
+        "remote_interface": "GigabitEthernet0/0",
+        "cdp_remote_ip": "10.0.1.1",
+        "remote_type": "Router"
+      },
+      "R3": {
+        "local_interface": "GigabitEthernet0/1",
+        "remote_interface": "GigabitEthernet0/1",
+        "cdp_remote_ip": "10.0.2.2",
+        "remote_type": "Router"
+      }
+    }
+  }
 }

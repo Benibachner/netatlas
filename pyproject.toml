@@ -7,4 +7,5 @@ requires-python = ">=3.13"
 dependencies = [
     "netmiko>=4.6.0",
     "pyats[full]>=26.1",
+    "pyvis>=0.3.2",
 ]
