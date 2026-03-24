@@ -98,12 +98,19 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         mgmt_addrs = neighbor_data.get('management_addresses', {})
         cdp_remote_ip = list(mgmt_addrs.keys())[0] if mgmt_addrs else None
 
-        caps = neighbor_data.get('capabilities', '')
-        remote_type = "Unknown"
-        if "Router" in caps or "R" in caps:
-            remote_type = "Router"
-        elif "Switch" in caps or "S" in caps:
+        caps = neighbor_data.get('capabilities', [])
+
+        if isinstance(caps, list):
+            caps = [c.lower() for c in caps]
+        else:
+            caps = str(caps).lower().split()
+
+        if "switch" in caps:
             remote_type = "Switch"
+        elif "router" in caps:
+            remote_type = "Router"
+        else:
+            remote_type = "Unknown"
 
         if not cdp_remote_ip:
             continue
