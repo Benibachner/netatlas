@@ -8,6 +8,7 @@ import logging
 import warnings
 import webbrowser
 import os
+import hashlib
 from netmiko import ConnectHandler
 import base64
 
@@ -19,8 +20,7 @@ def get_image_data_uri(filepath):
     
     with open(filepath, "rb") as image_file:
         encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-        ext = os.path.splitext(filepath)[1][1:].lower() # z.B. 'png'
-        # Bei SVG muss der MIME-Type image/svg+xml sein
+        ext = os.path.splitext(filepath)[1][1:].lower() 
         mime_type = "image/svg+xml" if ext == "svg" else f"image/{ext}"
         return f"data:{mime_type};base64,{encoded_string}"
 
@@ -32,7 +32,7 @@ warnings.filterwarnings('ignore')
 
 # Globale Variablen
 topology = {}
-visited_hosts = set()
+visited_hosts = set() # Speichert nun die Hashes
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Advanced L2/L3 Network Discovery (GNS3 Style)")
@@ -42,12 +42,52 @@ def parse_arguments():
     parser.add_argument("-e", "--enable", help="Enable secret (optional)")
     return parser.parse_args()
 
-def dfs_discover(conn, current_ip, current_hostname, username, password, enable_secret):
-    if current_hostname in visited_hosts:
-        return
+def get_device_hash(conn):
+    """
+    Holt 'show interfaces', filtert die 'up' Interfaces und deren BIA.
+    Generiert daraus einen SHA256 Hash zur eindeutigen Identifikation.
+    Netmiko behandelt das Paging (--More--) hierbei automatisch.
+    """
+    try:
+        output = conn.send_command("show interfaces")
+    except Exception as e:
+        print(f"  [!] Fehler beim Auslesen der Interfaces für Hash: {e}")
+        return "error_" + str(time.time())
+
+    macs = []
+    is_up = False
     
-    visited_hosts.add(current_hostname)
-    print(f"[+] Analyzing: {current_hostname} ({current_ip})")
+    for line in output.splitlines():
+        # Prüfe ob das Interface up ist
+        if " is up, line protocol is up" in line:
+            is_up = True
+        elif " is down" in line or " is administratively down" in line:
+            is_up = False
+            
+        # Wenn up, suche nach BIA
+        if is_up and "bia" in line:
+            match = re.search(r'bia\s+([a-fA-F0-9\.]+)', line)
+            if match:
+                macs.append(match.group(1).lower())
+            is_up = False # Reset bis zum nächsten Interface
+            
+    if not macs:
+        # Fallback, falls absolut kein Interface "up" ist (z.B. Management Port only)
+        macs.append("no_up_interfaces_" + str(time.time()))
+        
+    macs.sort()
+    mac_string = "".join(macs)
+    return hashlib.sha256(mac_string.encode()).hexdigest()
+
+def dfs_discover(conn, current_ip, current_hostname, username, password, enable_secret):
+    # 1. Gerät anhand seiner BIA-MACs identifizieren
+    current_hash = get_device_hash(conn)
+    
+    if current_hash in visited_hosts:
+        return current_hash
+    
+    visited_hosts.add(current_hash)
+    print(f"[+] Analyzing: {current_hostname} ({current_ip}) -> Hash: {current_hash[:8]}...")
     
     conn.set_base_prompt()
     
@@ -75,12 +115,13 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         cdp_out = conn.send_command("show cdp neighbors detail", use_genie=True)
     except Exception as e:
         print(f"  [!] CDP parse error: {e}")
-        return
+        return current_hash
 
     if not isinstance(cdp_out, dict) or 'index' not in cdp_out:
-        return
+        return current_hash
 
-    topology[current_hostname] = {
+    topology[current_hash] = {
+        "hostname": current_hostname, # Hostname für GUI behalten
         "management_ip": current_ip,
         "device_type": "Unknown",
         "interfaces": intf_ips,
@@ -98,35 +139,42 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         mgmt_addrs = neighbor_data.get('management_addresses', {})
         cdp_remote_ip = list(mgmt_addrs.keys())[0] if mgmt_addrs else None
 
-        caps = neighbor_data.get('capabilities', [])
+        caps = neighbor_data.get('capabilities', "")
 
+        # Normalize to string
         if isinstance(caps, list):
-            caps = [c.lower() for c in caps]
+            caps_str = " ".join(caps).lower()
         else:
-            caps = str(caps).lower().split()
+            caps_str = str(caps).lower()
 
-        if "switch" in caps:
+        remote_type = "Unknown"
+
+        # Strikte Unterscheidung: Switch vs Router
+        if "switch" in caps_str:
             remote_type = "Switch"
-        elif "router" in caps:
+        elif "router" in caps_str:
             remote_type = "Router"
-        else:
-            remote_type = "Unknown"
 
         if not cdp_remote_ip:
             continue
             
-        topology[current_hostname]["neighbors"][neigh_hostname] = {
+        link_data = {
+            "remote_hostname": neigh_hostname,
             "local_interface": local_int,
             "remote_interface": remote_int,
             "cdp_remote_ip": cdp_remote_ip,
             "remote_type": remote_type
         }
         
-        if neigh_hostname not in visited_hosts:
-            neighbors_to_visit.append((neigh_hostname, cdp_remote_ip))
+        neighbors_to_visit.append((neigh_hostname, cdp_remote_ip, link_data))
 
-    for neigh_host, neigh_ip in neighbors_to_visit:
-        if neigh_host in visited_hosts:
+    for neigh_host, neigh_ip, link_data in neighbors_to_visit:
+        
+        # Effizienz-Check: Haben wir diese IP schon im Dictionary als Hash?
+        known_ips = {data["management_ip"]: h for h, data in topology.items()}
+        if neigh_ip in known_ips:
+            neigh_hash = known_ips[neigh_ip]
+            topology[current_hash]["neighbors"][neigh_hash] = link_data
             continue
             
         print(f"  -> SSH: {current_hostname} -> {neigh_host} ({neigh_ip})")
@@ -152,6 +200,8 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         if not login_success:
             print(f"  [!] SSH failed: {neigh_host}")
             conn.write_channel("\x03")
+            # Unreachable Node mit Fake-ID speichern, damit er gezeichnet wird
+            topology[current_hash]["neighbors"][f"unreachable_{neigh_host}"] = link_data
             continue
             
         time.sleep(2)
@@ -169,13 +219,19 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         time.sleep(0.5)
         conn.read_channel()
         
-        dfs_discover(conn, neigh_ip, neigh_host, username, password, enable_secret)
+        # Rekursion - gibt den Hash des Nachbarn zurück
+        neigh_hash = dfs_discover(conn, neigh_ip, neigh_host, username, password, enable_secret)
+        
+        if neigh_hash:
+             topology[current_hash]["neighbors"][neigh_hash] = link_data
         
         print(f"  <- Return: {neigh_host} -> {current_hostname}")
         conn.write_channel("exit\n")
         time.sleep(1)
         conn.read_channel()
         conn.set_base_prompt()
+        
+    return current_hash
 
 def get_intf_details(host_data, intf_name):
     if not host_data:
@@ -201,9 +257,9 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
     print(f"\n[*] Generating GNS3-style Cytoscape map: {output_file}")
     
     global_types = {}
-    for host, data in topology_dict.items():
-        for neigh, link_data in data.get("neighbors", {}).items():
-            global_types[neigh] = link_data.get("remote_type", "Unknown")
+    for host_hash, data in topology_dict.items():
+        for neigh_hash, link_data in data.get("neighbors", {}).items():
+            global_types[neigh_hash] = link_data.get("remote_type", "Unknown")
 
     cyto_elements = []
 
@@ -212,16 +268,17 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
     switch_icon = get_image_data_uri("/home/benedikt/switch.png")
 
     # 1. Nodes generieren
-    for hostname, data in topology_dict.items():
+    for node_hash, data in topology_dict.items():
+        hostname = data.get("hostname", "Unknown")
         mgmt_ip = data.get("management_ip", "Unknown")
-        dev_type = global_types.get(hostname, "Router")
+        dev_type = global_types.get(node_hash, "Unknown")
         
         node_label = f"{hostname}\n{mgmt_ip}"
-        icon = router_icon if dev_type == "Router" else switch_icon
+        icon = switch_icon if dev_type == "Switch" else router_icon
         
         cyto_elements.append({
             "data": {
-                "id": hostname,
+                "id": node_hash,
                 "label": node_label,
                 "image": icon,
                 "status": "online"
@@ -230,30 +287,34 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
 
     # 2. Edges generieren
     added_edges = set()
-    for hostname, data in topology_dict.items():
-        for neighbor, link_data in data.get("neighbors", {}).items():
+    for node_hash, data in topology_dict.items():
+        hostname = data.get("hostname", "Unknown")
+        
+        for neigh_hash, link_data in data.get("neighbors", {}).items():
             
             # Fehlende (unerreichbare) Nodes ergänzen
-            if neighbor not in topology_dict:
+            if neigh_hash not in topology_dict:
+                neigh_hostname = link_data.get("remote_hostname", "Unknown")
                 remote_type = link_data.get("remote_type", "Unknown")
-                icon = router_icon if remote_type == "Router" else switch_icon
-                if not any(e["data"].get("id") == neighbor for e in cyto_elements):
+                icon = switch_icon if remote_type == "Switch" else router_icon
+                
+                if not any(e["data"].get("id") == neigh_hash for e in cyto_elements):
                     cyto_elements.append({
                         "data": {
-                            "id": neighbor,
-                            "label": f"{neighbor}\nUnreachable",
+                            "id": neigh_hash,
+                            "label": f"{neigh_hostname}\nUnreachable",
                             "image": icon,
                             "status": "offline"
                         }
                     })
                 
-            edge_id = tuple(sorted((hostname, neighbor)))
+            edge_id = tuple(sorted((node_hash, neigh_hash)))
             if edge_id not in added_edges:
                 local_int = link_data.get("local_interface", "")
                 remote_int = link_data.get("remote_interface", "")
                 
-                local_ip, _ = get_intf_details(topology_dict.get(hostname), local_int)
-                remote_ip, _ = get_intf_details(topology_dict.get(neighbor), remote_int)
+                local_ip, _ = get_intf_details(topology_dict.get(node_hash), local_int)
+                remote_ip, _ = get_intf_details(topology_dict.get(neigh_hash), remote_int)
                 
                 # GNS3 Style: Kurze Namen (z.B. Gi0/0) + IP
                 src_label = f"{local_int}\n{local_ip}"
@@ -261,8 +322,8 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
                 
                 cyto_elements.append({
                     "data": {
-                        "source": hostname,
-                        "target": neighbor,
+                        "source": node_hash,
+                        "target": neigh_hash,
                         "sourceLabel": src_label,
                         "targetLabel": tgt_label
                     }
