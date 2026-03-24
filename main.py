@@ -8,9 +8,21 @@ import logging
 import warnings
 import webbrowser
 import os
-import base64
 from netmiko import ConnectHandler
-from pyvis.network import Network
+import base64
+
+def get_image_data_uri(filepath):
+    """Wandelt ein lokales Bild in eine Base64 Data URI um."""
+    if not os.path.exists(filepath):
+        print(f" [!] Bild nicht gefunden: {filepath}")
+        return ""
+    
+    with open(filepath, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+        ext = os.path.splitext(filepath)[1][1:].lower() # z.B. 'png'
+        # Bei SVG muss der MIME-Type image/svg+xml sein
+        mime_type = "image/svg+xml" if ext == "svg" else f"image/{ext}"
+        return f"data:{mime_type};base64,{encoded_string}"
 
 # --- FIX: Suppress noisy pyATS / Genie / Unicon Logs ---
 logging.getLogger('pyats').setLevel(logging.CRITICAL)
@@ -22,20 +34,8 @@ warnings.filterwarnings('ignore')
 topology = {}
 visited_hosts = set()
 
-def get_image_data_uri(filepath):
-    """Wandelt ein lokales Bild in eine Base64 Data URI um."""
-    if not os.path.exists(filepath):
-        print(f" [!] Bild nicht gefunden: {filepath}")
-        return ""
-    
-    with open(filepath, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-        ext = os.path.splitext(filepath)[1][1:].lower() 
-        mime_type = "image/svg+xml" if ext == "svg" else f"image/{ext}"
-        return f"data:{mime_type};base64,{encoded_string}"
-
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Advanced L2/L3 Network Discovery (PyVis)")
+    parser = argparse.ArgumentParser(description="Advanced L2/L3 Network Discovery (GNS3 Style)")
     parser.add_argument("-i", "--ip", required=True, help="Seed node management IP")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
     parser.add_argument("-p", "--password", help="SSH password (prompted if missing)")
@@ -190,60 +190,55 @@ def get_intf_details(host_data, intf_name):
                     return v_ip, descriptions.get(k_intf, "")
     return "Unassigned", ""
 
-def generate_topology_map_pyvis(topology_dict, output_file="topology_map.html"):
-    print(f"\n[*] Generating PyVis map: {output_file}")
-    
-    # Init PyVis Network
-    net = Network(height="100vh", width="100%", bgcolor="#ffffff", font_color="#333", directed=False)
+def generate_topology_map(topology_dict, output_file="topology_map.html"):
+    print(f"\n[*] Generating GNS3-style Cytoscape map: {output_file}")
     
     global_types = {}
     for host, data in topology_dict.items():
         for neigh, link_data in data.get("neighbors", {}).items():
             global_types[neigh] = link_data.get("remote_type", "Unknown")
 
-    # Icons (Pfade anpassen!)
+    cyto_elements = []
+
+    # SVG Data URIs für die Icons (Diese kannst du durch Links zu eigenen Bildern austauschen)
     router_icon = get_image_data_uri("/home/benedikt/router.png")
     switch_icon = get_image_data_uri("/home/benedikt/switch.png")
-
-    added_nodes = set()
 
     # 1. Nodes generieren
     for hostname, data in topology_dict.items():
         mgmt_ip = data.get("management_ip", "Unknown")
         dev_type = global_types.get(hostname, "Router")
         
-        node_label = f"{hostname}\n({mgmt_ip})"
-        # FIX: Hover-Information für den Node hinzugefügt (title)
-        node_hover = f"Hostname: {hostname}\nManagement IP: {mgmt_ip}\nType: {dev_type}"
-        
+        node_label = f"{hostname}\n{mgmt_ip}"
         icon = router_icon if dev_type == "Router" else switch_icon
         
-        net.add_node(hostname, 
-                     label=node_label, 
-                     title=node_hover, # Das hier ermöglicht das Hovern auf Nodes
-                     shape='image', 
-                     image=icon, 
-                     size=40, 
-                     font={'size': 14, 'face': 'sans-serif', 'multi': True, 'align': 'center'})
-        added_nodes.add(hostname)
+        cyto_elements.append({
+            "data": {
+                "id": hostname,
+                "label": node_label,
+                "image": icon,
+                "status": "online"
+            }
+        })
 
     # 2. Edges generieren
     added_edges = set()
     for hostname, data in topology_dict.items():
         for neighbor, link_data in data.get("neighbors", {}).items():
             
-            if neighbor not in added_nodes:
+            # Fehlende (unerreichbare) Nodes ergänzen
+            if neighbor not in topology_dict:
                 remote_type = link_data.get("remote_type", "Unknown")
                 icon = router_icon if remote_type == "Router" else switch_icon
-                # FIX: Auch für unerreichbare Nodes Tooltips hinzufügen
-                net.add_node(neighbor, 
-                             label=f"{neighbor}\n(Unreachable)", 
-                             title=f"Node {neighbor} was detected via CDP but not reached via SSH",
-                             shape='image', 
-                             image=icon, 
-                             size=40, 
-                             font={'color': 'red'})
-                added_nodes.add(neighbor)
+                if not any(e["data"].get("id") == neighbor for e in cyto_elements):
+                    cyto_elements.append({
+                        "data": {
+                            "id": neighbor,
+                            "label": f"{neighbor}\nUnreachable",
+                            "image": icon,
+                            "status": "offline"
+                        }
+                    })
                 
             edge_id = tuple(sorted((hostname, neighbor)))
             if edge_id not in added_edges:
@@ -253,69 +248,117 @@ def generate_topology_map_pyvis(topology_dict, output_file="topology_map.html"):
                 local_ip, _ = get_intf_details(topology_dict.get(hostname), local_int)
                 remote_ip, _ = get_intf_details(topology_dict.get(neighbor), remote_int)
                 
-                edge_label = f"{local_int} ↔ {remote_int}"
-                # FIX: Title für Edges (hast du bereits, stellen wir sicher, dass es sauber ist)
-                hover_info = f"Link Details:\n{hostname} ({local_int}): {local_ip}\n{neighbor} ({remote_int}): {remote_ip}"
+                # GNS3 Style: Kurze Namen (z.B. Gi0/0) + IP
+                src_label = f"{local_int}\n{local_ip}"
+                tgt_label = f"{remote_int}\n{remote_ip}"
                 
-                net.add_edge(hostname, neighbor, label=edge_label, title=hover_info, color="#999999", width=2, font={'size': 10, 'align': 'horizontal'})
+                cyto_elements.append({
+                    "data": {
+                        "source": hostname,
+                        "target": neighbor,
+                        "sourceLabel": src_label,
+                        "targetLabel": tgt_label
+                    }
+                })
                 added_edges.add(edge_id)
 
-    # FIX: Interaction-Block hinzugefügt, um Hover explizit zu erlauben
-    net.set_options("""
-    var options = {
-      "interaction": {
-        "hover": true,
-        "tooltipDelay": 200,
-        "hideEdgesOnDrag": false
-      },
-      "physics": {
-        "solver": "repulsion",
-        "repulsion": {
-          "centralGravity": 0.0,
-          "springLength": 350,
-          "springConstant": 0.05,
-          "nodeDistance": 300,
-          "damping": 0.09
-        },
-        "minVelocity": 0.75
-      },
-      "edges": {
-        "smooth": false
-      }
-    }
-    """)
+    elements_json = json.dumps(cyto_elements, indent=2)
 
-    net.write_html(output_file)
-    print(f"[+] Done! Opening {output_file}...")
-    webbrowser.open("file://" + os.path.realpath(output_file))
+    # HTML mit Cytoscape.js
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>GNS3 Style Topology</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <style>
+        body {{ margin: 0; padding: 0; background-color: #ffffff; font-family: sans-serif; }}
+        #cy {{ width: 100vw; height: 100vh; display: block; }}
+        #title {{ position: absolute; top: 10px; left: 20px; z-index: 10; background: rgba(255,255,255,0.8); padding: 10px; border-radius: 5px; }}
+    </style>
+</head>
+<body>
+    <div id="title"><h2>L3 Network Topology</h2><p>Drag nodes to arrange.</p></div>
+    <div id="cy"></div>
 
-    # Stabile PyVis/Vis.js Physik-Optionen (Repulsion pusht die Knoten hart auseinander)
-    net.set_options("""
-    var options = {
-      "physics": {
-        "solver": "repulsion",
-        "repulsion": {
-          "centralGravity": 0.0,
-          "springLength": 350,
-          "springConstant": 0.05,
-          "nodeDistance": 300,
-          "damping": 0.09
-        },
-        "minVelocity": 0.75
-      },
-      "edges": {
-        "smooth": false
-      }
-    }
-    """)
+    <script>
+        var elements = {elements_json};
 
-    # HTML speichern (PyVis nutzt standardmäßig UTF-8)
-    net.write_html(output_file)
-    
+        var cy = cytoscape({{
+            container: document.getElementById('cy'),
+            elements: elements,
+            style: [
+                {{
+                    selector: 'node',
+                    style: {{
+                        /* GNS3 Style Node */
+                        'background-image': 'data(image)',
+                        'background-fit': 'contain',
+                        'background-color': 'transparent',
+                        'border-width': 0,
+                        'background-opacity': 0,
+                        'width': 60,
+                        'height': 60,
+                        'label': 'data(label)',
+                        'text-valign': 'bottom',
+                        'text-halign': 'center',
+                        'text-margin-y': 5,
+                        'font-size': 12,
+                        'font-weight': 'bold',
+                        'text-wrap': 'wrap'
+                    }}
+                }},
+                {{
+                    selector: 'node[status="offline"]',
+                    style: {{ 'opacity': 0.4 }}
+                }},
+                {{
+                    selector: 'edge',
+                    style: {{
+                        /* Geradlinige Verbindungen (Keine Ecken) */
+                        'curve-style': 'straight',
+                        'width': 2,
+                        'line-color': '#999',
+                        
+                        /* Labels direkt an den Routern (Source & Target) */
+                        'source-label': 'data(sourceLabel)',
+                        'target-label': 'data(targetLabel)',
+                        
+                        /* Abstand der Labels vom Router-Icon (in Pixeln) */
+                        'source-text-offset': 60,
+                        'target-text-offset': 60,
+                        
+                        /* Text über der Linie rotieren */
+                        'edge-text-rotation': 'autorotate',
+                        'text-margin-y': -10,
+                        'font-size': 10,
+                        'color': '#333',
+                        'text-background-color': '#fff',
+                        'text-background-opacity': 0.7,
+                        'text-wrap': 'wrap'
+                    }}
+                }}
+            ],
+            layout: {{
+                name: 'cose',
+                nodeDimensionsIncludeLabels: true,
+                idealEdgeLength: 10000,
+                nodeRepulsion: 800000,
+                padding: 100,
+                componentSpacing: 200
+            }}
+        }});
+    </script>
+</body>
+</html>
+"""
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(html_content)
+        
     print(f"[+] Done! Opening {output_file} in your default browser...")
     filepath = "file://" + os.path.realpath(output_file)
     webbrowser.open(filepath)
-
 
 def main():
     args = parse_arguments()
@@ -347,8 +390,7 @@ def main():
         with open("topology.json", "w") as f:
             json.dump(topology, f, indent=2)
             
-        # Aufruf der neuen PyVis-Funktion
-        generate_topology_map_pyvis(topology)
+        generate_topology_map(topology)
         
     except Exception as e:
         print(f"[!] Initial connection failed: {e}")
