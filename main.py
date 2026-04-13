@@ -27,7 +27,7 @@ PROMPT_RE = re.compile(r"(?m)([^\r\n]+[>#])\s*$")
 
 TOPOLOGY_MAP_TEMPLATE_PATH = Path(__file__).with_name("topology_map_template.html")
 SSH_LOGIN_POLL_COUNT = 20
-SSH_LOGIN_POLL_DELAY_SEC = 0.5
+SSH_LOGIN_POLL_DELAY_SEC = 5
 
 
 def get_image_data_uri(filepath: str) -> str:
