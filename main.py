@@ -12,6 +12,9 @@ import hashlib
 from netmiko import ConnectHandler
 import base64
 
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+PROMPT_RE = re.compile(r"(?m)([^\r\n]+[>#])\s*$")
+
 def get_image_data_uri(filepath):
     """Wandelt ein lokales Bild in eine Base64 Data URI um."""
     if not os.path.exists(filepath):
@@ -33,6 +36,59 @@ warnings.filterwarnings('ignore')
 # Globale Variablen
 topology = {}
 visited_hosts = set() # Speichert nun die Hashes
+
+
+def strip_ansi(text):
+    return ANSI_ESCAPE_RE.sub("", text)
+
+
+def prompt_to_hostname(prompt):
+    prompt = strip_ansi(prompt).strip()
+    prompt = prompt.rstrip("#>").strip()
+    return prompt.split("(", 1)[0].strip()
+
+
+def wait_for_prompt(conn, timeout=15, sleep=0.5):
+    """
+    Liest Kanal-Output ein, bis ein CLI-Prompt am Zeilenende sichtbar ist.
+    Auf echten Geräten erscheinen Banner und ANSI-Sequenzen oft verzögert.
+    """
+    output = ""
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        chunk = conn.read_channel()
+        if chunk:
+            output += chunk
+            clean_output = strip_ansi(output)
+            match = PROMPT_RE.search(clean_output)
+            if match:
+                return match.group(1).strip(), clean_output
+
+        conn.write_channel("\n")
+        time.sleep(sleep)
+
+    return None, strip_ansi(output)
+
+
+def sync_base_prompt(conn, timeout=15):
+    """
+    Synchronisiert den Prompt robust. Fällt auf manuelle Prompt-Erkennung zurück,
+    wenn Netmiko auf langsamen oder gesprächigen Geräten scheitert.
+    """
+    try:
+        return conn.set_base_prompt()
+    except Exception:
+        prompt, output = wait_for_prompt(conn, timeout=timeout)
+        if not prompt:
+            raise ValueError(f"Pattern not detected: '(?:\\\\#|>)' in output.\nCaptured output:\n{output.strip()}")
+
+        base_prompt = prompt_to_hostname(prompt)
+        if not base_prompt:
+            raise ValueError(f"Prompt could not be derived from output:\n{output.strip()}")
+
+        conn.base_prompt = base_prompt
+        return base_prompt
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Advanced L2/L3 Network Discovery (GNS3 Style)")
@@ -89,7 +145,7 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
     visited_hosts.add(current_hash)
     print(f"[+] Analyzing: {current_hostname} ({current_ip}) -> Hash: {current_hash[:8]}...")
     
-    conn.set_base_prompt()
+    sync_base_prompt(conn)
     
     intf_descriptions = {}
     try:
@@ -150,10 +206,10 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         remote_type = "Unknown"
 
         # Strikte Unterscheidung: Switch vs Router
-        if "switch" in caps_str:
-            remote_type = "Switch"
-        elif "router" in caps_str:
+        if "router" in caps_str:
             remote_type = "Router"
+        elif "switch" in caps_str:
+            remote_type = "Switch"
 
         if not cdp_remote_ip:
             continue
@@ -208,13 +264,16 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         conn.write_channel("\n")
         time.sleep(0.5)
         
-        prompt_check = conn.read_channel()
-        if ">" in prompt_check and enable_secret:
+        prompt, prompt_check = wait_for_prompt(conn, timeout=15)
+        if prompt and prompt.endswith(">") and enable_secret:
             conn.write_channel("enable\n")
-            time.sleep(1)
-            conn.write_channel(enable_secret + "\n")
-            time.sleep(1)
-        
+            enable_prompt, enable_output = wait_for_prompt(conn, timeout=10)
+            if enable_prompt and enable_prompt.endswith("#"):
+                pass
+            elif "assword:" in enable_output:
+                conn.write_channel(enable_secret + "\n")
+                wait_for_prompt(conn, timeout=10)
+
         conn.write_channel("terminal length 0\n")
         time.sleep(0.5)
         conn.read_channel()
@@ -229,7 +288,7 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         conn.write_channel("exit\n")
         time.sleep(1)
         conn.read_channel()
-        conn.set_base_prompt()
+        sync_base_prompt(conn)
         
     return current_hash
 
@@ -446,8 +505,8 @@ def main():
         netmiko_conn = ConnectHandler(**device_params)
         netmiko_conn.enable()
         
-        start_prompt = netmiko_conn.find_prompt()
-        start_hostname = start_prompt.replace("#", "").replace(">", "").strip()
+        start_prompt = sync_base_prompt(netmiko_conn)
+        start_hostname = prompt_to_hostname(start_prompt)
         
         print("-" * 50)
         dfs_discover(netmiko_conn, args.ip, start_hostname, args.username, password, enable_secret)
