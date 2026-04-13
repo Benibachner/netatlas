@@ -1,3 +1,12 @@
+"""
+netatlas: CDP-based network discovery + HTML topology visualization.
+
+This script logs into a seed Cisco IOS device via SSH, reads CDP neighbors,
+and then "hops" to neighbors by running `ssh` from inside the device CLI
+(nested SSH sessions). The resulting graph is written to `topology.json`
+and rendered as a Cytoscape-based HTML file.
+"""
+
 import argparse
 import getpass
 import json
@@ -9,14 +18,20 @@ import warnings
 import webbrowser
 import os
 import hashlib
+from pathlib import Path
 from netmiko import ConnectHandler
 import base64
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 PROMPT_RE = re.compile(r"(?m)([^\r\n]+[>#])\s*$")
 
-def get_image_data_uri(filepath):
-    """Wandelt ein lokales Bild in eine Base64 Data URI um."""
+TOPOLOGY_MAP_TEMPLATE_PATH = Path(__file__).with_name("topology_map_template.html")
+SSH_LOGIN_POLL_COUNT = 20
+SSH_LOGIN_POLL_DELAY_SEC = 0.5
+
+
+def get_image_data_uri(filepath: str) -> str:
+    """Return a base64 data URI for a local image path (or empty string)."""
     if not os.path.exists(filepath):
         print(f" [!] Bild nicht gefunden: {filepath}")
         return ""
@@ -27,22 +42,23 @@ def get_image_data_uri(filepath):
         mime_type = "image/svg+xml" if ext == "svg" else f"image/{ext}"
         return f"data:{mime_type};base64,{encoded_string}"
 
-# --- FIX: Suppress noisy pyATS / Genie / Unicon Logs ---
 logging.getLogger('pyats').setLevel(logging.CRITICAL)
 logging.getLogger('genie').setLevel(logging.CRITICAL)
 logging.getLogger('unicon').setLevel(logging.CRITICAL)
 warnings.filterwarnings('ignore')
 
-# Globale Variablen
+# Global state
 topology = {}
-visited_hosts = set() # Speichert nun die Hashes
+visited_hosts = set()  # Stores device hashes we've already seen.
 
 
 def strip_ansi(text):
+    """Remove ANSI escape sequences from text."""
     return ANSI_ESCAPE_RE.sub("", text)
 
 
 def prompt_to_hostname(prompt):
+    """Extract a hostname-like string from a Cisco-style CLI prompt."""
     prompt = strip_ansi(prompt).strip()
     prompt = prompt.rstrip("#>").strip()
     return prompt.split("(", 1)[0].strip()
@@ -50,8 +66,10 @@ def prompt_to_hostname(prompt):
 
 def wait_for_prompt(conn, timeout=15, sleep=0.5):
     """
-    Liest Kanal-Output ein, bis ein CLI-Prompt am Zeilenende sichtbar ist.
-    Auf echten Geräten erscheinen Banner und ANSI-Sequenzen oft verzögert.
+    Read channel output until a CLI prompt appears at the end of a line.
+
+    This is used as a robust fallback for devices that print banners slowly or
+    where ANSI sequences/paging confuse the default prompt detection.
     """
     output = ""
     deadline = time.time() + timeout
@@ -73,8 +91,10 @@ def wait_for_prompt(conn, timeout=15, sleep=0.5):
 
 def sync_base_prompt(conn, timeout=15):
     """
-    Synchronisiert den Prompt robust. Fällt auf manuelle Prompt-Erkennung zurück,
-    wenn Netmiko auf langsamen oder gesprächigen Geräten scheitert.
+    Synchronize Netmiko's base prompt with a robust fallback.
+
+    Netmiko's `set_base_prompt()` can fail on slow/chatty devices. If that
+    happens we detect the prompt manually and set `conn.base_prompt`.
     """
     try:
         return conn.set_base_prompt()
@@ -91,6 +111,7 @@ def sync_base_prompt(conn, timeout=15):
         return base_prompt
 
 def parse_arguments():
+    """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Advanced L2/L3 Network Discovery (GNS3 Style)")
     parser.add_argument("-i", "--ip", required=True, help="Seed node management IP")
     parser.add_argument("-u", "--username", required=True, help="SSH username")
@@ -100,9 +121,11 @@ def parse_arguments():
 
 def get_device_hash(conn):
     """
-    Holt 'show interfaces', filtert die 'up' Interfaces und deren BIA.
-    Generiert daraus einen SHA256 Hash zur eindeutigen Identifikation.
-    Netmiko behandelt das Paging (--More--) hierbei automatisch.
+    Compute a stable-ish device identifier based on interface BIAs.
+
+    It runs `show interfaces`, collects the "bia" MACs from interfaces that are
+    "up, line protocol is up", sorts them and hashes the concatenation.
+    This is used to avoid revisiting the same physical device via different IPs.
     """
     try:
         output = conn.send_command("show interfaces")
@@ -114,29 +137,53 @@ def get_device_hash(conn):
     is_up = False
     
     for line in output.splitlines():
-        # Prüfe ob das Interface up ist
         if " is up, line protocol is up" in line:
             is_up = True
         elif " is down" in line or " is administratively down" in line:
             is_up = False
             
-        # Wenn up, suche nach BIA
         if is_up and "bia" in line:
             match = re.search(r'bia\s+([a-fA-F0-9\.]+)', line)
             if match:
                 macs.append(match.group(1).lower())
-            is_up = False # Reset bis zum nächsten Interface
+            is_up = False
             
     if not macs:
-        # Fallback, falls absolut kein Interface "up" ist (z.B. Management Port only)
         macs.append("no_up_interfaces_" + str(time.time()))
         
     macs.sort()
     mac_string = "".join(macs)
     return hashlib.sha256(mac_string.encode()).hexdigest()
 
+def infer_remote_type(cdp_capabilities) -> str:
+    """
+    Infer a remote device type string from CDP capabilities.
+
+    Capabilities may come back as a list or a string; we normalize it and check
+    for the keywords "router" and "switch".
+    """
+    if isinstance(cdp_capabilities, list):
+        caps_str = " ".join(cdp_capabilities).lower()
+    else:
+        caps_str = str(cdp_capabilities).lower()
+
+    if "router" in caps_str:
+        return "Router"
+    if "switch" in caps_str:
+        return "Switch"
+    return "Unknown"
+
 def dfs_discover(conn, current_ip, current_hostname, username, password, enable_secret):
-    # 1. Gerät anhand seiner BIA-MACs identifizieren
+    """
+    Depth-first CDP discovery starting from the current device.
+
+    How it works:
+    - Reads local interface descriptions and IPs (best-effort).
+    - Parses `show cdp neighbors detail` for neighbor management IPs.
+    - "Hops" to neighbors by issuing `ssh -l user <ip>` inside the current CLI
+      session (nested SSH), discovers recursively, then `exit`s back.
+    """
+    # Identify device by its interface MACs (so we don't loop forever).
     current_hash = get_device_hash(conn)
     
     if current_hash in visited_hosts:
@@ -177,7 +224,7 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         return current_hash
 
     topology[current_hash] = {
-        "hostname": current_hostname, # Hostname für GUI behalten
+        "hostname": current_hostname,  # Keep hostname for the UI.
         "management_ip": current_ip,
         "device_type": "Unknown",
         "interfaces": intf_ips,
@@ -195,21 +242,7 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         mgmt_addrs = neighbor_data.get('management_addresses', {})
         cdp_remote_ip = list(mgmt_addrs.keys())[0] if mgmt_addrs else None
 
-        caps = neighbor_data.get('capabilities', "")
-
-        # Normalize to string
-        if isinstance(caps, list):
-            caps_str = " ".join(caps).lower()
-        else:
-            caps_str = str(caps).lower()
-
-        remote_type = "Unknown"
-
-        # Strikte Unterscheidung: Switch vs Router
-        if "router" in caps_str:
-            remote_type = "Router"
-        elif "switch" in caps_str:
-            remote_type = "Switch"
+        remote_type = infer_remote_type(neighbor_data.get('capabilities', ""))
 
         if not cdp_remote_ip:
             continue
@@ -226,7 +259,6 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
 
     for neigh_host, neigh_ip, link_data in neighbors_to_visit:
         
-        # Effizienz-Check: Haben wir diese IP schon im Dictionary als Hash?
         known_ips = {data["management_ip"]: h for h, data in topology.items()}
         if neigh_ip in known_ips:
             neigh_hash = known_ips[neigh_ip]
@@ -239,8 +271,8 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         conn.write_channel(f"ssh -l {username} {neigh_ip}\n")
         
         login_success = False
-        for _ in range(20):
-            time.sleep(0.5)
+        for _ in range(SSH_LOGIN_POLL_COUNT):
+            time.sleep(SSH_LOGIN_POLL_DELAY_SEC)
             chunk = conn.read_channel()
             if "yes/no" in chunk:
                 conn.write_channel("yes\n")
@@ -256,7 +288,7 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         if not login_success:
             print(f"  [!] SSH failed: {neigh_host}")
             conn.write_channel("\x03")
-            # Unreachable Node mit Fake-ID speichern, damit er gezeichnet wird
+            # Store an unreachable node with a synthetic id so it still renders.
             topology[current_hash]["neighbors"][f"unreachable_{neigh_host}"] = link_data
             continue
             
@@ -278,7 +310,6 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
         time.sleep(0.5)
         conn.read_channel()
         
-        # Rekursion - gibt den Hash des Nachbarn zurück
         neigh_hash = dfs_discover(conn, neigh_ip, neigh_host, username, password, enable_secret)
         
         if neigh_hash:
@@ -293,6 +324,7 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
     return current_hash
 
 def get_intf_details(host_data, intf_name):
+    """Return (ip, description) for an interface name, with a fuzzy fallback."""
     if not host_data:
         return "Unassigned", ""
     interfaces = host_data.get("interfaces", {})
@@ -312,7 +344,12 @@ def get_intf_details(host_data, intf_name):
                     return v_ip, descriptions.get(k_intf, "")
     return "Unassigned", ""
 
+def load_topology_map_template() -> str:
+    """Load the HTML template used for the Cytoscape topology map."""
+    return TOPOLOGY_MAP_TEMPLATE_PATH.read_text(encoding="utf-8")
+
 def generate_topology_map(topology_dict, output_file="topology_map.html"):
+    """Render `topology_dict` into a Cytoscape HTML file and open it."""
     print(f"\n[*] Generating GNS3-style Cytoscape map: {output_file}")
     
     global_types = {}
@@ -322,11 +359,10 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
 
     cyto_elements = []
 
-    # SVG Data URIs für die Icons (Diese kannst du durch Links zu eigenen Bildern austauschen)
+    # Data URIs for node icons.
     router_icon = get_image_data_uri("/home/benedikt/router.png")
     switch_icon = get_image_data_uri("/home/benedikt/switch.png")
 
-    # 1. Nodes generieren
     for node_hash, data in topology_dict.items():
         hostname = data.get("hostname", "Unknown")
         mgmt_ip = data.get("management_ip", "Unknown")
@@ -344,14 +380,12 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
             }
         })
 
-    # 2. Edges generieren
     added_edges = set()
     for node_hash, data in topology_dict.items():
         hostname = data.get("hostname", "Unknown")
         
         for neigh_hash, link_data in data.get("neighbors", {}).items():
             
-            # Fehlende (unerreichbare) Nodes ergänzen
             if neigh_hash not in topology_dict:
                 neigh_hostname = link_data.get("remote_hostname", "Unknown")
                 remote_type = link_data.get("remote_type", "Unknown")
@@ -375,7 +409,6 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
                 local_ip, _ = get_intf_details(topology_dict.get(node_hash), local_int)
                 remote_ip, _ = get_intf_details(topology_dict.get(neigh_hash), remote_int)
                 
-                # GNS3 Style: Kurze Namen (z.B. Gi0/0) + IP
                 src_label = f"{local_int}\n{local_ip}"
                 tgt_label = f"{remote_int}\n{remote_ip}"
                 
@@ -391,103 +424,18 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
 
     elements_json = json.dumps(cyto_elements, indent=2)
 
-    # HTML mit Cytoscape.js
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>GNS3 Style Topology</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
-    <style>
-        body {{ margin: 0; padding: 0; background-color: #ffffff; font-family: sans-serif; }}
-        #cy {{ width: 100vw; height: 100vh; display: block; }}
-        #title {{ position: absolute; top: 10px; left: 20px; z-index: 10; background: rgba(255,255,255,0.8); padding: 10px; border-radius: 5px; }}
-    </style>
-</head>
-<body>
-    <div id="title"><h2>L3 Network Topology</h2><p>Drag nodes to arrange.</p></div>
-    <div id="cy"></div>
-
-    <script>
-        var elements = {elements_json};
-
-        var cy = cytoscape({{
-            container: document.getElementById('cy'),
-            elements: elements,
-            style: [
-                {{
-                    selector: 'node',
-                    style: {{
-                        /* GNS3 Style Node */
-                        'background-image': 'data(image)',
-                        'background-fit': 'contain',
-                        'background-color': 'transparent',
-                        'border-width': 0,
-                        'background-opacity': 0,
-                        'width': 60,
-                        'height': 60,
-                        'label': 'data(label)',
-                        'text-valign': 'bottom',
-                        'text-halign': 'center',
-                        'text-margin-y': 5,
-                        'font-size': 12,
-                        'font-weight': 'bold',
-                        'text-wrap': 'wrap'
-                    }}
-                }},
-                {{
-                    selector: 'node[status="offline"]',
-                    style: {{ 'opacity': 0.4 }}
-                }},
-                {{
-                    selector: 'edge',
-                    style: {{
-                        /* Geradlinige Verbindungen (Keine Ecken) */
-                        'curve-style': 'straight',
-                        'width': 2,
-                        'line-color': '#999',
-                        
-                        /* Labels direkt an den Routern (Source & Target) */
-                        'source-label': 'data(sourceLabel)',
-                        'target-label': 'data(targetLabel)',
-                        
-                        /* Abstand der Labels vom Router-Icon (in Pixeln) */
-                        'source-text-offset': 60,
-                        'target-text-offset': 60,
-                        
-                        /* Text über der Linie rotieren */
-                        'edge-text-rotation': 'autorotate',
-                        'text-margin-y': -10,
-                        'font-size': 10,
-                        'color': '#333',
-                        'text-background-color': '#fff',
-                        'text-background-opacity': 0.7,
-                        'text-wrap': 'wrap'
-                    }}
-                }}
-            ],
-            layout: {{
-                name: 'cose',
-                nodeDimensionsIncludeLabels: true,
-                idealEdgeLength: 10000,
-                nodeRepulsion: 800000,
-                padding: 100,
-                componentSpacing: 200
-            }}
-        }});
-    </script>
-</body>
-</html>
-"""
+    template = load_topology_map_template()
+    html_content = template.replace("__ELEMENTS_JSON__", elements_json)
 
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(html_content)
         
-    print(f"[+] Done! Opening {output_file} in your default browser...")
+    print(f"[+] Done! Opening {output_file} in your browser...")
     filepath = "file://" + os.path.realpath(output_file)
     webbrowser.open(filepath)
 
 def main():
+    """Entrypoint: connect to seed device, discover, then write outputs."""
     args = parse_arguments()
     password = args.password or getpass.getpass(prompt="SSH Password: ")
     enable_secret = args.enable if args.enable else password
