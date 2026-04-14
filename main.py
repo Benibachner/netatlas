@@ -25,7 +25,12 @@ import base64
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 PROMPT_RE = re.compile(r"(?m)([^\r\n]+[>#])\s*$")
 
-TOPOLOGY_MAP_TEMPLATE_PATH = Path(__file__).with_name("topology_map_template.html")
+def get_resource_path(filename):
+    if hasattr(sys, '_MEIPASS'):
+        return Path(sys._MEIPASS) / filename
+    return Path(__file__).parent / filename
+
+TOPOLOGY_MAP_TEMPLATE_PATH = get_resource_path("topology_map_template.html")
 SSH_LOGIN_POLL_COUNT = 20
 SSH_LOGIN_POLL_DELAY_SEC = 5
 
@@ -173,6 +178,61 @@ def infer_remote_type(cdp_capabilities) -> str:
         return "Switch"
     return "Unknown"
 
+def parse_interfaces_description(output):
+    result = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            intf = parts[0]
+            desc = " ".join(parts[3:])
+            result[intf] = desc
+    return result
+
+
+def parse_ip_interface_brief(output):
+    result = {}
+    for line in output.splitlines():
+        if "Interface" in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            intf = parts[0]
+            ip = parts[1]
+            if ip.lower() != "unassigned":
+                result[intf] = ip
+    return result
+
+
+def parse_cdp_neighbors_detail(output):
+    neighbors = []
+    current = {}
+
+    for line in output.splitlines():
+        line = line.strip()
+
+        if line.startswith("Device ID:"):
+            if current:
+                neighbors.append(current)
+                current = {}
+            current["device_id"] = line.split(":", 1)[1].strip()
+
+        elif "IP address:" in line:
+            current["ip"] = line.split(":", 1)[1].strip()
+
+        elif line.startswith("Interface:"):
+            parts = line.split(",")
+            if len(parts) >= 2:
+                current["local_interface"] = parts[0].split(":")[1].strip()
+                current["remote_interface"] = parts[1].split(":")[1].strip()
+
+        elif "Capabilities:" in line:
+            current["capabilities"] = line.split(":", 1)[1].strip()
+
+    if current:
+        neighbors.append(current)
+
+    return neighbors
+
 def dfs_discover(conn, current_ip, current_hostname, username, password, enable_secret):
     """
     Depth-first CDP discovery starting from the current device.
@@ -194,34 +254,32 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
     
     sync_base_prompt(conn)
     
+    # Interfaces Description
     intf_descriptions = {}
     try:
-        desc_out = conn.send_command("show interfaces description", use_genie=True)
-        if isinstance(desc_out, dict) and 'interfaces' in desc_out:
-            for intf, data in desc_out['interfaces'].items():
-                intf_descriptions[intf] = data.get('description', '')
-    except Exception:
-        pass 
-
-    intf_ips = {}
-    try:
-        ip_out = conn.send_command("show ip interface brief", use_genie=True)
-        if isinstance(ip_out, dict) and 'interface' in ip_out:
-            for intf, data in ip_out['interface'].items():
-                ip = data.get('ip_address', 'Unassigned')
-                if ip and ip != 'unassigned':
-                    intf_ips[intf] = ip
+        desc_out = conn.send_command("show interfaces description")
+        intf_descriptions = parse_interfaces_description(desc_out)
     except Exception:
         pass
 
+    # Interface IPs
+    intf_ips = {}
     try:
-        cdp_out = conn.send_command("show cdp neighbors detail", use_genie=True)
+        ip_out = conn.send_command("show ip interface brief")
+        intf_ips = parse_ip_interface_brief(ip_out)
+    except Exception:
+        pass
+
+    # CDP
+    try:
+        cdp_raw = conn.send_command("show cdp neighbors detail")
+        cdp_neighbors = parse_cdp_neighbors_detail(cdp_raw)
     except Exception as e:
         print(f"  [!] CDP parse error: {e}")
         return current_hash
 
-    if not isinstance(cdp_out, dict) or 'index' not in cdp_out:
-        return current_hash
+        if not isinstance(cdp_out, dict) or 'index' not in cdp_out:
+            return current_hash
 
     topology[current_hash] = {
         "hostname": current_hostname,  # Keep hostname for the UI.
@@ -234,14 +292,11 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
 
     neighbors_to_visit = []
 
-    for idx, neighbor_data in cdp_out.get('index', {}).items():
+    for neighbor_data in cdp_neighbors:
         neigh_hostname = neighbor_data.get('device_id', '').split('.')[0]
         local_int = neighbor_data.get('local_interface', '')
-        remote_int = neighbor_data.get('port_id', '')
-        
-        mgmt_addrs = neighbor_data.get('management_addresses', {})
-        cdp_remote_ip = list(mgmt_addrs.keys())[0] if mgmt_addrs else None
-
+        remote_int = neighbor_data.get('remote_interface', '')
+        cdp_remote_ip = neighbor_data.get('ip')
         remote_type = infer_remote_type(neighbor_data.get('capabilities', ""))
 
         if not cdp_remote_ip:
