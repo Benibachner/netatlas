@@ -381,7 +381,7 @@ def dfs_discover(conn, current_ip, current_hostname, username, password, enable_
 def get_intf_details(host_data, intf_name):
     """Return (ip, description) for an interface name, with a fuzzy fallback."""
     if not host_data:
-        return "Unassigned", ""
+        return "", ""
     interfaces = host_data.get("interfaces", {})
     descriptions = host_data.get("descriptions", {})
     
@@ -397,7 +397,17 @@ def get_intf_details(host_data, intf_name):
                 k_prefix, k_port = k_match.groups()
                 if prefix[:2].lower() == k_prefix[:2].lower() and port == k_port:
                     return v_ip, descriptions.get(k_intf, "")
-    return "Unassigned", ""
+    return "", ""
+
+def format_intf_label(intf_name: str, ip: str) -> str:
+    """Format an interface label; omit IP line when IP is empty/unassigned."""
+    ip = (ip or "").strip()
+    intf_name = (intf_name or "").strip()
+    if not ip:
+        return intf_name
+    if not intf_name:
+        return ip
+    return f"{intf_name}\n{ip}"
 
 def load_topology_map_template() -> str:
     """Load the HTML template used for the Cytoscape topology map."""
@@ -464,8 +474,8 @@ def generate_topology_map(topology_dict, output_file="topology_map.html"):
                 local_ip, _ = get_intf_details(topology_dict.get(node_hash), local_int)
                 remote_ip, _ = get_intf_details(topology_dict.get(neigh_hash), remote_int)
                 
-                src_label = f"{local_int}\n{local_ip}"
-                tgt_label = f"{remote_int}\n{remote_ip}"
+                src_label = format_intf_label(local_int, local_ip)
+                tgt_label = format_intf_label(remote_int, remote_ip)
                 
                 cyto_elements.append({
                     "data": {
